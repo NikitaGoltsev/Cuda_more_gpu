@@ -207,6 +207,7 @@ __global__ void calc_borders(double *matrixA, double *matrixB, size_t size,
   if (idxUp == 0 || idxUp > size - 2)
     return;
 
+  // ??? Разобраться ???
   if (idxUp < size) {
     matrixB[size + idx] =
         0.25 * (matrixA[size + idx - 1] + matrixA[2 * size + idx] +
@@ -242,3 +243,6 @@ __global__ void get_error(double *matrixA, double *matrixB,
     outputMatrix[idx] = std::abs(matrixB[idx] - matrixA[idx]);
   }
 }
+
+// Замерить так же на 2048 4096 8192( 1, 2 и 4 процесса)
+// Сделать сравнение
