@@ -88,9 +88,7 @@ int main(int argc, char **argv) {
   dim3 blockDim(threads_x, 1);
   dim3 gridDim(blocks_x, blocks_y);
 
-  ////////////////////////////////////////////////////////////////////////////
   // Here I give memory for one action( step or move)
-  ////////////////////////////////////////////////////////////////////////////
   cudaMalloc((void **)&deviceMatrixAPtr,
              sizeOfAllocatedMemory * sizeof(double));
   cudaMalloc((void **)&deviceMatrixBPtr,
@@ -98,18 +96,14 @@ int main(int argc, char **argv) {
   cudaMalloc((void **)&errorMatrix, sizeOfAllocatedMemory * sizeof(double));
   cudaMalloc((void **)&deviceError, sizeof(double));
 
-  ////////////////////////////////////////////////////////////////////////////
   // Copy of matrix in located memory
-  ////////////////////////////////////////////////////////////////////////////
   size_t offset = (rank != 0) ? size : 0;
   cudaMemcpy(deviceMatrixAPtr, matrixA + (startYIdx * size) - offset,
              sizeof(double) * sizeOfAllocatedMemory, cudaMemcpyHostToDevice);
   cudaMemcpy(deviceMatrixBPtr, matrixB + (startYIdx * size) - offset,
              sizeof(double) * sizeOfAllocatedMemory, cudaMemcpyHostToDevice);
 
-  ////////////////////////////////////////////////////////////////////////////
   // Work with buffer's size 
-  ////////////////////////////////////////////////////////////////////////////
   size_t tempStorageSize = 0;
   cub::DeviceReduce::Max(tempStorage, tempStorageSize, errorMatrix, deviceError,
                          size * sizeOfAreaForOneProcess);
@@ -125,29 +119,22 @@ int main(int argc, char **argv) {
 
   int iter = 0;
 
-  ////////////////////////////////////////////////////////////////////////////
   // start of calculation
-  ////////////////////////////////////////////////////////////////////////////
   clock_t begin = clock();
   while ((iter < maxIter) && (*error) > minError) {
     iter++;
 
-    ////////////////////////////////////////////////////////////////////////////
     // Calculation for boards ( I would like to send it for anothre process)
-    ////////////////////////////////////////////////////////////////////////////
     calc_borders<<<size, 1, 0, stream>>>(deviceMatrixAPtr, deviceMatrixBPtr,
                                          size, sizeOfAreaForOneProcess);
 
     cudaStreamSynchronize(stream);
-    ////////////////////////////////////////////////////////////////////////////
+    
     // matrix calculation
-    ////////////////////////////////////////////////////////////////////////////
     heat_equation<<<gridDim, blockDim, 0, matrixCalculationStream>>>(
         deviceMatrixAPtr, deviceMatrixBPtr, size, sizeOfAreaForOneProcess);
 
-    ////////////////////////////////////////////////////////////////////////////
     // I check error for everu 100 iteration
-    ////////////////////////////////////////////////////////////////////////////
     if (iter % 100 == 0) {
       get_error<<<gridDim, blockDim, 0, stream>>>(
           deviceMatrixAPtr, deviceMatrixBPtr, errorMatrix, size,
@@ -158,9 +145,7 @@ int main(int argc, char **argv) {
 
       cudaStreamSynchronize(stream);
 
-      ////////////////////////////////////////////////////////////////////////////
       // In searching of max error
-      ////////////////////////////////////////////////////////////////////////////
       MPI_Allreduce((void *)deviceError, (void *)deviceError, 1, MPI_DOUBLE,
                     MPI_MAX, MPI_COMM_WORLD);
 
