@@ -208,7 +208,6 @@ __global__ void calc_borders(double *matrixA, double *matrixB, size_t size,
     return;
 
   // ??? Разобраться ???
-  if (idxUp < size) {
     matrixB[size + idx] =
         0.25 * (matrixA[size + idx - 1] + matrixA[2 * size + idx] +
                 matrixA[*size + idx + 1]);
@@ -217,7 +216,6 @@ __global__ void calc_borders(double *matrixA, double *matrixB, size_t size,
                 matrixA[(sizePerGpu - 3) * size + idx] +
                 matrixA[(sizePerGpu - 1) * size + idx] +
                 matrixA[(sizePerGpu - 2) * size + idx + 1]);
-  }
 }
 
 __global__ void heat_equation(double *matrixA, double *matrixB, size_t size,
