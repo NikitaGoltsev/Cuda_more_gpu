@@ -1,345 +1,406 @@
+/*
+ * Решение уравнения теплопроводности (пятиточечный шаблон) в двумерной области на равномерных
+ * сетках (128^2, 256^2, 512^2, 1024^2). Граничные условия – линейная интерполяция между
+ * углами области. Значение в углах – 10, 20, 30, 20.
+ *
+ * Параметры (точность, размер сетки, количество итераций) задаваются через
+ * параметры командной строки.
+ *
+ * Вывод программы - количество итераций и достигнутое значение ошибки.
+ *
+ * Операция редукции (подсчет максимальной ошибки) для одного MPI процесса реализована с
+ * использованием библиотеки CUB. Подсчет глобального значения ошибки, обмен граничными
+ * условиями реализуется с использованием MPI
+ */
+
 #include <iostream>
 #include <cstring>
 #include <cmath>
-#include <ctime>
-#include <iomanip>
-#include <exception>
-#include <cuda_runtime.h>
+#include <chrono>
+#include "cuda_runtime.h"
 #include <cub/cub.cuh>
 #include <mpi.h>
 
-// error checks
-#define CUDACHECK(name) if (cudaGetLastError() != cudaSuccess) { throw std::runtime_error(name); } 
-#define MPI_CHECK(code, name) if (code != MPI_SUCCESS) { throw std::runtime_error(name); }
+#ifdef _FLOAT
+#define T float
+#define MAX std::fmaxf
+#define STOD std::stof
+#define MPI_T MPI_FLOAT
+#else
+#define T double
+#define MAX std::fmax
+#define STOD std::stod
+#define MPI_T MPI_DOUBLE
+#endif
 
-// macros for average interpolation calculation
-#define AVG_CALC(A, Anew, size, i, j) Anew[i * size + j] = 0.25 * (A[i * size + j - 1] + A[(i - 1) * size + j] + A[(i + 1) * size + j] + A[i * size + j + 1]);
+// Макрос индексации с 0
+#define IDX2C(i, j, ld) (((i) * (ld)) + (j))
 
-// pointers for error and other matrixes
-double 	*A 		= nullptr,  // buffer for main matrix
-	*Anew		= nullptr,  // buffer for matrix where we store our interpolations
-	*dev_A 	        = nullptr,  // A on device
-	*dev_Anew	= nullptr,  // Anew on device
-        *buff           = nullptr,  // buffer for abs_diff calculation
-	*d_out 		= nullptr,  // buffer for error on device
-	*d_temp_storage = nullptr;  // temporary buffer for cub max reduction
-
-// handler funnction which executes before end of program execution and frees memory allocated dynamically
-void free_pointers()
-{
-	std::cout << "End of execution" << std::endl;
-	
-	// free memory section
-	if (A) 	            cudaFreeHost(A); 		CUDACHECK("free A")
-	if (Anew) 	    cudaFreeHost(Anew); 	CUDACHECK("free Anew")
-	if (dev_A)	    cudaFree(dev_A); 		CUDACHECK("free dev_A")
-	if (dev_Anew) 	    cudaFree(dev_Anew); 	CUDACHECK("free dev_Anew")
-    	if (buff)           cudaFree(buff); 		CUDACHECK("free buff")
-	if (d_out) 	    cudaFree(d_out);	        CUDACHECK("free d_out")
-	if (d_temp_storage) cudaFree(d_temp_storage);   CUDACHECK("free d_temp_storage")
-		
-	std::cout << "Memory has been freed" << std::endl;
-}
-
-// interpolation on matrix field
-__global__ void interpolate(double* A, double* Anew, size_t size, size_t size_per_one_gpu)
-{
-	unsigned int x_idx = blockIdx.x * blockDim.x + threadIdx.x;
-	unsigned int y_idx = blockIdx.y * blockDim.y + threadIdx.y;
-
-	if(!(x_idx < 1 || y_idx < 2 || x_idx > size - 2 || y_idx > size_per_one_gpu - 2)) {
-		AVG_CALC(A, Anew, size, y_idx, x_idx)
-	}	
-}
-
-// interpolation on the matrix edges between devices
-__global__ void interpolate_boundaries(double* A, double* Anew, size_t size, size_t size_per_one_gpu){
-	unsigned int up_idx = blockIdx.x * blockDim.x + threadIdx.x;
-	unsigned int down_idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-	// check if horizontal index between 1 and (size - 2) then calculates result
-	if (!(up_idx == 0 || up_idx > size - 2)) {
-		AVG_CALC(A, Anew, size, 1, up_idx)
-		AVG_CALC(A, Anew, size, (size_per_one_gpu - 2), down_idx)
-	}
-}
-
-// modular difference between A and Anew stored in buff
-__global__ void abs_diff(double* A, double* Anew, double* buff, size_t size, size_t size_per_one_gpu) {
-
-	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
-	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
-	size_t idx = y * size + x;
-	
-	// check if idx in allocated area then calculate result
-	if(!(x <= 0 || y <= 0 || x >= (size - 1) || y >= (size_per_one_gpu - 1)))
-	{
-		buff[idx] = std::abs(A[idx] - Anew[idx]);
-	}
-}
-
-int findNearestPowerOfTwo(size_t num) {
-    int power = 1;
-    while (power < num) {
-        power <<= 1;
+// Макрос проверки статуса операции CUDA
+#define CUDA_CHECK(err)                                                        \
+    {                                                                          \
+        cudaError_t err_ = (err);                                              \
+        if (err_ != cudaSuccess)                                               \
+        {                                                                      \
+            std::printf("CUDA error %d at %s:%d\n", err_, __FILE__, __LINE__); \
+            throw std::runtime_error("CUDA error");                            \
+        }                                                                      \
     }
-    return power;
+
+// Вывести свойства девайса
+void print_device_properties(void)
+{
+    cudaDeviceProp deviceProp;
+    if (cudaSuccess == cudaGetDeviceProperties(&deviceProp, 0))
+    {
+        printf("Warp size in threads is %d.\n", deviceProp.warpSize);
+        printf("Maximum size of each dimension of a block is %d, %d, %d.\n", deviceProp.maxThreadsDim[0], deviceProp.maxThreadsDim[1], deviceProp.maxThreadsDim[2]);
+        printf("Maximum size of each dimension of a grid is %d, %d, %d.\n", deviceProp.maxGridSize[0], deviceProp.maxGridSize[1], deviceProp.maxGridSize[2]);
+        printf("Maximum resident threads per multiprocessor is %d.\n", deviceProp.maxThreadsPerMultiProcessor);
+        printf("Maximum number of resident blocks per multiprocessor is %d.\n", deviceProp.maxBlocksPerMultiProcessor);
+        printf("_____________________________________________________________________________________________\n");
+    }
 }
 
-int main(int argc, char* argv[])
+// Вывести значения двумерного массива на gpu
+void print_array_gpu(T *A, uint32_t h, uint32_t w)
 {
-	auto atExifStatus = std::atexit(free_pointers);
-	if (atExifStatus != 0)
-	{
-		std::cout << "Register error" << std::endl;
-		exit(-1);
-	}
+    for (int i = 0; i < h; ++i)
+    {
+        for (int j = 0; j < w; ++j)
+            printf("%.2f\t", A[IDX2C(i, j, w)]);
+        printf("\n");
+    }
+    printf("\n");
+}
 
-	if (argc != 4)
-	{
-		std::cout << "Invalid parameters count" << std::endl;
-		std::exit(-1);
-	}
-	
-	try {
-		//reads command prompt arguments: ./task4.out [max_aaccuracy] [size] [max_iterations]
-		double max_accuracy = std::stod(argv[1]);
-		int size = std::stoi(argv[2]);
-		int matrixSize = size * size;  // total matrix size
-		int max_iterations = std::stoi(argv[3]);
+// Инициализация матрицы, чтобы подготовить ее к основному алгоритму
+void initialize_array(T *A, int size)
+{
+    // Заполнение углов матрицы значениями
+    A[IDX2C(0, 0, size)] = 10.0;
+    A[IDX2C(0, size - 1, size)] = 20.0;
+    A[IDX2C(size - 1, 0, size)] = 20.0;
+    A[IDX2C(size - 1, size - 1, size)] = 30.0;
 
-		// rank - number of device, device_group_size - number of devices used by MPI, error_code - buffer for error message
-		int rank, device_group_size, error_code;
+    // Заполнение периметра матрицы
+    T step = 10.0 / (size - 1);
 
-		// init MPI from command prompt arguments
-		error_code = MPI_Init(&argc, &argv);
-		MPI_CHECK(error_code, "mpi initialization")
+    for (int i = 1; i < size - 1; ++i)
+    {
+        T addend = step * i;
+        A[IDX2C(0, i, size)] = A[IDX2C(0, 0, size)] + addend;               // horizontal
+        A[IDX2C(size - 1, i, size)] = A[IDX2C(size - 1, 0, size)] + addend; // horizontal
+        A[IDX2C(i, 0, size)] = A[IDX2C(0, 0, size)] + addend;               // vertical
+        A[IDX2C(i, size - 1, size)] = A[IDX2C(0, size - 1, size)] + addend; // vertical
+    }
+}
 
-		// get commutator rank from all possible
-		error_code = MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-		MPI_CHECK(error_code, "mpi communicator rank_init")
+// Посчитать часть матрицы
+__global__ void calculate_matrix(T *Anew, T *A, uint32_t h, uint32_t w)
+{
+    uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+    uint32_t j = blockDim.y * blockIdx.y + threadIdx.y;
 
-		// get device count used by MPI
-		error_code = MPI_Comm_size(MPI_COMM_WORLD, &device_group_size);
-		MPI_CHECK(error_code, "mpi communicator size_init")
+    // Граница или выход за границы массива - ничего не делать
+    if (i >= h - 1 || j >= w - 1 || i == 0 || j == 0)
+        return;
 
-		// check if programm uses enough number of devices for next calculations
-		int deviceCount = 0;
-		cudaGetDeviceCount(&deviceCount);
-		printf("%d - number of devices\n", deviceCount);
-		if (deviceCount < device_group_size || device_group_size < 1) {
-			std::cout << "INvalid number of devices!";
-			std::exit(-1);
-		}
+    Anew[IDX2C(i, j, w)] = (A[IDX2C(i + 1, j, w)] + A[IDX2C(i - 1, j, w)] + A[IDX2C(i, j - 1, w)] + A[IDX2C(i, j + 1, w)]) * 0.25;
+}
 
-		// choose device
-		cudaSetDevice(rank);
-		CUDACHECK("cuda set device")
-		printf("device rank: %d\n", rank);
+// O = |A-B|
+__global__ void count_matrix_difference(T *matrixA, T *matrixB, T *outputMatrix, uint32_t h, uint32_t w)
+{
+    uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+    uint32_t j = blockDim.y * blockIdx.y + threadIdx.y;
 
-		// edges for calculating
-		size_t area_for_one_process = size / device_group_size;
-		size_t start_y_idx = area_for_one_process * rank;
+    // Выход за границы массива или периметр - ничего не делать
+    if (i >= h - 1 || j >= w - 1 || i == 0 || j == 0)
+        return;
 
-		//allocate matrixes on host
-		cudaMallocHost((void**)&A, matrixSize * sizeof(double));
-		CUDACHECK("A host alloc")
-		cudaMallocHost((void**)&Anew, matrixSize * sizeof(double));
-		CUDACHECK("Anew host alloc")
+    uint32_t idx = IDX2C(i, j, w);
+    outputMatrix[idx] = std::abs(matrixB[idx] - matrixA[idx]);
+}
 
-		std::memset(A, 0, matrixSize * sizeof(double));
-		std::memset(Anew, 0, matrixSize * sizeof(double));
+// Поделиться данными с соседями
+void transfer_data(const int rank, const int size, T *A_host, T *A_device, uint32_t h, uint32_t w, cudaStream_t stream = 0)
+{
+    MPI_Status status;
 
+    // Обмен с соседом сверху
+    if (rank != 0)
+    {
+        // отправляем указатель на вторую строку процессу, работующему сверху, и принимаем строку от верхнего
+        CUDA_CHECK(cudaMemcpyAsync(A_host + w, A_device + w, w * sizeof(T), cudaMemcpyDeviceToHost, stream));
 
-		// matrix edge interpolation
-		A[0] = 10.0;
-		A[size - 1] = 20.0;
-		A[size * size - 1] = 30.0;
-		A[size * (size - 1)] = 20.0;
+        MPI_Sendrecv(A_host + w, w, MPI_T, rank - 1, rank - 1,
+                               A_host, w, MPI_T, rank - 1, rank,
+                               MPI_COMM_WORLD, &status);
 
-		Anew[0] = 10.0;
-		Anew[size - 1] = 20.0;
-		Anew[size * size - 1] = 30.0;
-		Anew[size * (size - 1)] = 20.0;
+        CUDA_CHECK(cudaMemcpyAsync(A_device, A_host, w * sizeof(T), cudaMemcpyHostToDevice, stream));
+    }
 
-		double step = 10.0 / (size - 1);
-		for (int i = 1; i < size - 1; i++) {
-			A[i] = A[0] + i * step;
-			A[i * size] = A[0] + i * step;
-			A[size - 1 + size * i] = A[size - 1] + i * step;
-			A[size * (size - 1) + i] = A[size * (size - 1)] + i * step;
+    // Обмен с соседом снизу
+    if (rank != size - 1)
+    {
+        // отправляем свою вторую строку вниз и принимаем строку от нижнего
+        CUDA_CHECK(cudaMemcpyAsync(A_host + w * (h - 2), A_device + w * (h - 2), w * sizeof(T), cudaMemcpyDeviceToHost, stream));
 
-			Anew[i] = Anew[0] + i * step;
-			Anew[i * size] = Anew[0] + i * step;
-			Anew[size - 1 + size * i] = Anew[size - 1] + i * step;
-			Anew[size * (size - 1) + i] = Anew[size * (size - 1)] + i * step;
-		}
+        MPI_Sendrecv(A_host + w * (h - 2), w, MPI_T, rank + 1, rank + 1,
+                               A_host + (w * (h - 1)), w, MPI_T, rank + 1, rank,
+                               MPI_COMM_WORLD,&status);
 
-		// calculate used area for each process
-		if (rank != 0 && rank != device_group_size - 1)
-		{
-			area_for_one_process += 2;
-		}
-		else if (device_group_size != 1)
-		{
-			area_for_one_process += 1;
-		}
+        CUDA_CHECK(cudaMemcpyAsync(A_device + (w * (h - 1)), A_host + (w * (h - 1)), w * sizeof(T), cudaMemcpyHostToDevice, stream));
+    }
+}
 
-		// memory size for one device
-		size_t alloc_memsize = size * area_for_one_process;
+int main(int argc, char *argv[])
+{
+    // Парсинг аргументов командной строки
+    int net_size = 128, iter_max = (int)1e6;
+    T accuracy = 1e-6;
+    bool res = false;
+    for (int arg = 1; arg < argc; arg++)
+    {
+        std::string str = argv[arg];
+        if (!str.compare("-res"))
+            res = true;
+        else
+        {
+            arg++;
+            if (!str.compare("-a"))
+                accuracy = STOD(argv[arg]);
+            else if (!str.compare("-i"))
+                iter_max = (int)std::stod(argv[arg]);
+            else if (!str.compare("-s"))
+                net_size = std::stoi(argv[arg]);
+            else
+            {
+                std::cout << "Wrong args!\n";
+                return -1;
+            }
+        }
+    }
 
-		// memory allocation for pointer will be used on device
-		cudaMalloc((void**)&buff, alloc_memsize * sizeof(double));
-		CUDACHECK("alloc buff")
-		cudaMalloc((void**)&dev_A, alloc_memsize * sizeof(double));
-		CUDACHECK("alloc dev_A")
-		cudaMalloc((void**)&dev_Anew, alloc_memsize * sizeof(double));
-		CUDACHECK("alloc dev_Anew")
+    // Инициализация библиотеки MPI
+    MPI_Init(&argc, &argv);
 
-		// memset + memcpy
-		size_t offset = (rank != 0) ? size : 0;
-		cudaMemset(dev_A, 0, sizeof(double) * alloc_memsize);
-		CUDACHECK("memset dev_A")
-		cudaMemset(dev_Anew, 0, sizeof(double) * alloc_memsize);
-		CUDACHECK("memset dev_Anew")
-		cudaMemcpy(dev_A, A + (start_y_idx * size) - offset, sizeof(double) * alloc_memsize, cudaMemcpyHostToDevice);
-		CUDACHECK("memcpy from A to dev_A from start_y_idx coordinate with offset")
-		cudaMemcpy(dev_Anew, Anew + (start_y_idx * size) - offset, sizeof(double) * alloc_memsize, cudaMemcpyHostToDevice);
-		CUDACHECK("memcpy from Anew to dev_Anew with from start_y_idx coordinate offset")
+    // Две информационных функции: сообщают размер группы (то есть общее количество задач, подсоединенных к ее области связи) и порядковый номер вызывающей задачи:
+    //   MPI_COMM_WORLD - название коммуникатора (описателя области связи), создаваемого библиотекой автоматически.
+    //   Он описывает стартовую область связи, объединяющую все процессы приложения.
+    int size, rank;
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
-		// allocates buffer 'd_out' to contain max('abs_diff' function result)
-		double* d_out;
-		cudaMalloc((void**)&d_out, sizeof(double));
-		CUDACHECK("alloc d_out")
+    // Размер сетки должен быть кратен количеству GPU
+    if(net_size % size)
+        MPI_Abort(MPI_COMM_WORLD, 5);
 
-		// allocates memory for temporary storage ton use Max reduction and sets temp_storage_bytes with size of d_temp_storage in bytes
-		void* d_temp_storage = NULL;
-		size_t temp_storage_bytes = 0;
-		cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, buff, d_out, size * area_for_one_process);
-		CUDACHECK("get temp_storage_bytes")
-		cudaMalloc(&d_temp_storage, temp_storage_bytes);
-		CUDACHECK("temp storage memory allocation")
+    // Каждый процесс выбирает свой девайс
+    cudaSetDevice(rank);
 
-		// variables for loop execution
-		double accuracy = max_accuracy + 1.0;  // current accuracy
-		int num_of_iterations = 0;  // current number of iterations
+    /*
+     * rank 0 - главный процесс, на нем происходит инциализация и отправка частей массива другим процессам.
+     * Каждый процесс обрабатывает net_size_local строк. Главный тоже рабоатет.
+     * Матрица делится на равные части и эти части раздаются процессам, еще 2 строки нужны для
+     * коммуникации с следующим процессом. Самые нижняя и самая верхняя строка будет восприниматься
+     * процессом как граница и не будет изменена.
+     */
 
-		// streams for calculations: cuda_stream - for blocks to sync them, matrix_calc_stream - for othre operation
-		cudaStream_t cuda_stream, matrix_calc_stream;
-		cudaStreamCreate(&cuda_stream);
-		CUDACHECK("cuda_stream creation")
-		cudaStreamCreate(&matrix_calc_stream);
-		CUDACHECK("matrix_calc_stream creation")
+    // Фактическое количество элементов в массиве
+    const size_t vec_size_global = net_size * net_size;
 
-		// params for cuda functions
-		unsigned int threads_x = std::min(findNearestPowerOfTwo(size), 1024);
-		unsigned int blocks_y = area_for_one_process;
-		unsigned int blocks_x = size / threads_x + 1;
+    // Количество строк для данного процесса
+    size_t net_height = net_size / size + 2 * (rank != size - 1); // Последнему не нужно еще 2 строки
 
-		dim3 blockDim(threads_x, 1);
-		dim3 gridDim(blocks_x, blocks_y);
+    const size_t vec_size_local = net_height * net_size;
 
-		while (num_of_iterations < max_iterations && accuracy > max_accuracy) {
+    // Объявление необходимых указателей и выделение памяти
+    // Матрица на хосте (нужна только для инициализации и вывода) и
+    // матрица ошибок на девайсе - сюда будут приходить по одному значению с каждого процесса [rank 0]
+    T *A_global = nullptr, *Aerr_global = nullptr;
 
-			interpolate_boundaries<<<size, 1, 0, cuda_stream>>>(dev_A, dev_Anew, size, area_for_one_process);
+    // Матрицы для работы процесса: 1 на хосте, 2 на девайсе и еще одна на девайсе для разности
+    T *A, *A_dev, *Anew_dev, *A_err_dev;
 
-			interpolate<<<gridDim, blockDim, 0, matrix_calc_stream>>>(dev_A, dev_Anew, size, area_for_one_process);
-			
-			// updates accuracy 1/100 times of main cycle iterations and on the last iteration
-			if (num_of_iterations % 100 == 0 || num_of_iterations + 1 == max_iterations) {
-				
-				// synchronize to understand either we can make operations with matrix or not
-				cudaStreamSynchronize(cuda_stream);
-				CUDACHECK("cuda_stream synchronize after interpolation")
+    CUDA_CHECK(cudaMallocHost(&A, sizeof(T) * vec_size_local));
+    CUDA_CHECK(cudaMalloc(&A_dev, sizeof(T) * vec_size_local));
+    CUDA_CHECK(cudaMalloc(&Anew_dev, sizeof(T) * vec_size_local));
+    CUDA_CHECK(cudaMalloc(&A_err_dev, sizeof(T) * vec_size_local));
 
-				abs_diff<<<gridDim, blockDim, 0, matrix_calc_stream>>>(dev_A, dev_Anew, buff, size, area_for_one_process);
+    if (rank == 0)
+    {
+        CUDA_CHECK(cudaMallocHost(&A_global, sizeof(T) * vec_size_global));
+        CUDA_CHECK(cudaMallocHost(&Aerr_global, sizeof(T) * size));
 
-				// cub max reduction
-				cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, buff, d_out, alloc_memsize, matrix_calc_stream);
-				CUDACHECK("cub max reduction")
+        // Инициализация матрицы
+        initialize_array(A_global, net_size);
 
-				// synchronize streams to receive actual d_out max values from all devices
-				cudaStreamSynchronize(matrix_calc_stream);
-				CUDACHECK("matrix_calc_stream synchronization (inside error calculations)")
+        // if (res)
+        //     print_array_gpu(A_global, net_size, net_size);
 
-				// receive max d_out values from all devices
-				error_code = MPI_Allreduce((void*)d_out, (void*)d_out, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-				MPI_CHECK(error_code, "mpi reduction")
+        // Отправка частей массива всем процессам
+        // Смещение указателя начала данных
+        int array_offset = 0;
+        // Количество элементов для отправки
+        int data_length = 0;
+        for (size_t receiver = 0; receiver < size; ++receiver)
+        {
+            MPI_Request req;
 
-				// copy values from d_out on GPU to accuracy on CPU
-				cudaMemcpyAsync(&accuracy, d_out, sizeof(double), cudaMemcpyDeviceToHost, matrix_calc_stream);
-				CUDACHECK("copy to accuracy")
-			}
+            // Количество элементов для передачи. Как уже было отмечено,
+            // последнему передается на 2 строки меньше, чем остальным.
+            if (receiver == size - 1 && size > 1)
+                data_length = (net_height - 2) * net_size;
+            else
+                data_length = vec_size_local;
 
-			// receive top edge
-			if (rank != 0)
-			{
-				error_code = MPI_Sendrecv(
-					dev_Anew + size + 1,  // sending buffer
-					size - 2,  // size of sent data
-					MPI_DOUBLE,  // sening data type
-					rank - 1,  // where data was sent
-					0,  //
-					dev_Anew + 1,  // receiving buffer
-					size - 2,  // size of received data
-					MPI_DOUBLE,  // received data type
-					rank - 1,  // received from which device
-					0, 
-					MPI_COMM_WORLD,  // communicator
-					MPI_STATUS_IGNORE
-				);
-				MPI_CHECK(error_code, "top edge receiving")
-			}
+            // Отправка
+            MPI_Isend(A_global + array_offset, data_length, MPI_T, receiver, 0, MPI_COMM_WORLD, &req);
 
-			// receive bottom edge
-			if (rank != device_group_size - 1)
-			{
-				error_code = MPI_Sendrecv(
-					dev_Anew + (area_for_one_process - 2) * size + 1, 
-					size - 2, 
-					MPI_DOUBLE, 
-					rank + 1,
-					0,
-					dev_Anew + (area_for_one_process - 1) * size + 1, 
-					size - 2, 
-					MPI_DOUBLE, 
-					rank + 1, 
-					0, 
-					MPI_COMM_WORLD, 
-					MPI_STATUS_IGNORE
-				);
-				MPI_CHECK(error_code, "bottom edge receiving")
-			}
+            // Не забываем, что есть еще 2 строки, используемые другими процессами
+            array_offset += (net_height - 2) * net_size;
+        }
+    }
 
-			// synchronize streams before next calculations
-			cudaStreamSynchronize(matrix_calc_stream);
-			CUDACHECK("matrix_calc_stream synchronization (main loop after MPI_Sendrecv)")
+    // Получение данных от rank 0
 
-			++num_of_iterations;
-			std::swap(dev_A, dev_Anew); // swap pointers for next calculations
-		}
+    MPI_Status status; // А он зачем?
+    MPI_Recv(A, vec_size_local, MPI_T, 0, 0, MPI_COMM_WORLD, &status);
 
-		cudaStreamDestroy(cuda_stream);
-		CUDACHECK("Destroy cuda_stream")
-		cudaStreamDestroy(matrix_calc_stream);
-		CUDACHECK("Destroy matrix_calc_stream")
+    //std::cout << "rank = " << rank << "\tvec_size_local = " << vec_size_local << "\n";
 
-		if (rank == 0) {
-			printf("Iterations: %d\nAccuracy: %lf\n", num_of_iterations, accuracy);
-		}
-		
-		// end MPI engine
-		error_code = MPI_Finalize();
-		MPI_CHECK(error_code, "mpi finalize")
+    // Скопировать матрицу с хоста на матрицы на девайсе
+    CUDA_CHECK(cudaMemcpy(A_dev, A, sizeof(T) * vec_size_local, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(Anew_dev, A, sizeof(T) * vec_size_local, cudaMemcpyHostToDevice));
 
-		std::cout << "MPI engine was shut down" << std::endl;
+    // Потоков в одном блоке (32 * 32)
+    dim3 threadPerBlock = dim3(32, 32);
+    // Блоков в сетке (size / 32)
+    dim3 blockPerGrid = dim3(ceil((double)net_height / 32), ceil((double)net_size / 32));
+    // Текущая ошибка
+    T *error, *error_dev;
+    CUDA_CHECK(cudaMallocHost(&error, sizeof(T)));
+    CUDA_CHECK(cudaMalloc(&error_dev, sizeof(T)));
+    *error = accuracy + 1;
 
-	}
-	catch (std::runtime_error& error) {
-		std::cout << error.what() << std::endl;
-		std::cout << "Program execution stops" << std::endl;
-		exit(-1);	
-	}
+    // Временный буфер для редукции и его размер
+    T *reduction_bufer = NULL;
+    uint64_t reduction_bufer_size = 0;
 
-	return 0;
+    // Первый вызов, чтобы предоставить количество байтов, необходимое для временного хранения, необходимого CUB.
+    cub::DeviceReduce::Max(reduction_bufer, reduction_bufer_size, A_err_dev, error_dev, vec_size_local);
+
+    // Выделение памяти под буфер
+    CUDA_CHECK(cudaMalloc(&reduction_bufer, reduction_bufer_size));
+
+    // Сокращение количества обращений к CPU. Больше сетка - реже стоит проверять ошибку.
+    uint32_t skipped_checks_counts = (iter_max < net_size) ? iter_max : net_size;
+    skipped_checks_counts += skipped_checks_counts % 2; // Привести к четному числу
+
+    // Счетчик итераций
+    int iter = 0;
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
+    // Начать отсчет времени работы
+    auto begin_main = std::chrono::steady_clock::now();
+
+    for (iter = 0; iter < iter_max && *error > accuracy; iter += skipped_checks_counts)
+    {
+        for (uint32_t k = 0; k < skipped_checks_counts; k += 2)
+        {
+            // Итерация пересчета
+            calculate_matrix<<<blockPerGrid, threadPerBlock, 0, stream>>>(A_dev, Anew_dev, net_height, net_size);
+            // Обмен граничными условиями
+            transfer_data(rank, size, A, A_dev, net_height, net_size, stream);
+
+            // То же самое, но матрицы A_dev и Anew_dev поменялись местами (замена swap)
+            calculate_matrix<<<blockPerGrid, threadPerBlock, 0, stream>>>(Anew_dev, A_dev, net_height, net_size);
+            transfer_data(rank, size, A, Anew_dev, net_height, net_size, stream);
+        }
+
+        count_matrix_difference<<<blockPerGrid, threadPerBlock, 0, stream>>>(A_dev, Anew_dev, A_err_dev, net_height, net_size);
+
+        // Найти максимум и положить в error_dev - аналог reduction (max : error_dev) в OpenACC
+        cub::DeviceReduce::Max(reduction_bufer, reduction_bufer_size, A_err_dev, error_dev, vec_size_local, stream);
+
+        // Копировать ошибку с девайса на хост
+        CUDA_CHECK(cudaMemcpy(error, error_dev, sizeof(T), cudaMemcpyDeviceToHost));
+
+        // Сборка локальных максимальных ошибок с каждого процесса
+        MPI_Gather(error, 1, MPI_T, Aerr_global, 1, MPI_T, 0, MPI_COMM_WORLD);
+        if (rank == 0)
+        {
+            *error = 0;
+            for (int i = 0; i < size; ++i)
+            {
+                *error = MAX(*error, Aerr_global[i]);
+            }
+        }
+        // Точка синхронизации
+        MPI_Barrier(MPI_COMM_WORLD);
+        // Разослать всем процессам глобальную максимальную ошибку
+        MPI_Bcast(error, 1, MPI_T, 0, MPI_COMM_WORLD);
+    }
+    cudaStreamDestroy(stream);
+
+    // Посчитать время выполнения
+    auto end_main = std::chrono::steady_clock::now();
+    int time_spent = std::chrono::duration_cast<std::chrono::milliseconds>(end_main - begin_main).count();
+    // Вывод
+    if (res)
+    {
+        // Отправка на хост
+        CUDA_CHECK(cudaMemcpy(A, A_dev, sizeof(T) * vec_size_local, cudaMemcpyDeviceToHost));
+
+        // Отправка rank 0
+        MPI_Request req;
+        // Первая и последняя строка пропускается
+        MPI_Isend(A + net_size, (net_height - 2) * net_size, MPI_T, 0, 0, MPI_COMM_WORLD, &req);
+
+        if (rank == 0)
+        {
+            // Начинаем принимать со второй строки
+            int array_offset = net_size;
+            MPI_Status status;
+            for (size_t sender = 0; sender < size; ++sender)
+            {
+                int recive_size = 0;
+                if (sender != size - 1 || size == 1)
+                    recive_size = (net_height - 2) * net_size;
+                else
+                    recive_size = (net_height - 4) * net_size;
+
+                MPI_Recv(A_global + array_offset, recive_size, MPI_T, sender, 0, MPI_COMM_WORLD, &status);
+                array_offset += recive_size;
+            }
+
+            // И наконец-то вывод в консоль
+            print_array_gpu(A_global, net_size, net_size);
+        }
+    }
+    if (rank == 0)
+    {
+        std::cout << "Iter: " << iter << " Error: " << *error << std::endl;
+        std::cout << "Time:\t\t" << time_spent << " ms\n";
+        CUDA_CHECK(cudaFreeHost(A_global));
+        CUDA_CHECK(cudaFreeHost(Aerr_global));
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    // Освобождение памяти
+    CUDA_CHECK(cudaFreeHost(A));
+    CUDA_CHECK(cudaFreeHost(error));
+    CUDA_CHECK(cudaFree(reduction_bufer));
+    CUDA_CHECK(cudaFree(A_err_dev));
+    CUDA_CHECK(cudaFree(A_dev));
+    CUDA_CHECK(cudaFree(Anew_dev));
+    CUDA_CHECK(cudaFree(error_dev));
+
+    // Нормальное закрытие библиотеки
+    MPI_Finalize();
+    return 0;
 }
